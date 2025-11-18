@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import csv
-from datetime import datetime, date
+from datetime import datetime, date, time
 
 from telegram import (
     Update,
@@ -29,7 +29,14 @@ if not TELEGRAM_TOKEN:
 DB_PATH = "sales.db"
 
 # Conversation states
-ADD_PRODUCT, ADD_SALE, DELETE_PRODUCT = range(3)
+(
+    ADD_PRODUCT,
+    ADD_SALE,
+    DELETE_PRODUCT,
+    EDIT_PRODUCT_SELECT,
+    EDIT_PRODUCT_FIELD,
+    EDIT_PRODUCT_VALUE,
+) = range(6)
 
 # =========================
 # KEYBOARD BUTTON TEXT
@@ -50,12 +57,20 @@ BTN_DELETE_PRODUCT = "🗑 Hapus Produk"
 
 BTN_BACK_MAIN = "🔙 Kembali ke Menu Utama"
 
-BTN_BACK_UTILITY = "🔙 Kembali ke Menu Utama"  # sama text
-BTN_BACK_MANAGE = "🔙 Kembali ke Menu Utama"
-
 BTN_BACKUP_DATA = "💾 Backup Data"
 BTN_EXPORT_DATA = "📤 Export Data"
 BTN_EDIT_SETTINGS = "🛠 Edit Pengaturan"
+
+BTN_CURRENCY = "💰 Mata Uang"
+BTN_DATE_FORMAT = "📅 Format Tanggal"
+BTN_AUTO_BACKUP = "🔐 Auto Backup"
+BTN_NOTIFICATION = "🔔 Notifikasi"
+
+# Untuk edit produk (field)
+BTN_EDIT_NAME = "✏️ Ubah Nama"
+BTN_EDIT_PRICE = "💰 Ubah Harga"
+BTN_EDIT_CATEGORY = "🏷 Ubah Model/Kategori"
+BTN_CANCEL_EDIT = "❌ Batal Edit"
 
 
 # =========================
@@ -91,6 +106,16 @@ def init_db():
         """
     )
 
+    # Untuk notifikasi harian per chat
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            chat_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -110,11 +135,11 @@ def add_product_db(name: str, price: int, category: str):
     conn.close()
 
 
-def list_products_db(limit: int = 20):
+def list_products_db(limit: int = 50):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute(
-        "SELECT id, name, price, category FROM products ORDER BY id DESC LIMIT ?",
+        "SELECT id, name, price, category FROM products ORDER BY id ASC LIMIT ?",
         (limit,),
     )
     rows = c.fetchall()
@@ -132,6 +157,17 @@ def get_product_by_id(product_id: int):
     row = c.fetchone()
     conn.close()
     return row
+
+
+def update_product_field(product_id: int, field: str, value):
+    allowed = {"name", "price", "category"}
+    if field not in allowed:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(f"UPDATE products SET {field} = ? WHERE id = ?", (value, product_id))
+    conn.commit()
+    conn.close()
 
 
 def delete_product_db(product_id: int):
@@ -237,6 +273,36 @@ def get_top_products(limit: int = 5):
     return rows
 
 
+# === Subscriptions (notif harian) ===
+
+def is_subscribed(chat_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT enabled FROM subscriptions WHERE chat_id = ?", (chat_id,)
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return False
+    return bool(row[0])
+
+
+def set_subscription(chat_id: int, enabled: bool):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO subscriptions (chat_id, enabled)
+        VALUES (?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET enabled = excluded.enabled
+        """,
+        (chat_id, int(enabled)),
+    )
+    conn.commit()
+    conn.close()
+
+
 # =========================
 # KEYBOARD BUILDERS
 # =========================
@@ -269,14 +335,32 @@ def utility_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
+def settings_edit_keyboard():
+    keyboard = [
+        [BTN_CURRENCY, BTN_DATE_FORMAT],
+        [BTN_AUTO_BACKUP, BTN_NOTIFICATION],
+        [BTN_BACK_MAIN],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def edit_product_field_keyboard():
+    keyboard = [
+        [BTN_EDIT_NAME, BTN_EDIT_PRICE],
+        [BTN_EDIT_CATEGORY],
+        [BTN_CANCEL_EDIT],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
 # =========================
-# HANDLERS
+# HANDLERS UTAMA
 # =========================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🏠 *Menu Utama*\n\n"
-        "Bot ini buat rekap produk & penjualan.\n\n"
+        "Bot rekap penjualan VanzShop.\n\n"
         "Silakan pilih menu di bawah:"
     )
     await update.message.reply_text(
@@ -291,16 +375,59 @@ async def handle_back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- Tambah Produk (Conversation) ----------
+# =========================
+# TAMBAH PRODUK (Conversation)
+# =========================
+
+def _parse_product_input(text: str):
+    """
+    Support 2 format:
+    1) Nama | Harga | Kategori
+    2) Nama Harga Kategori  (tanpa |, harga = kata kedua dari belakang)
+    """
+    text = text.strip()
+
+    # Format pakai "|"
+    if "|" in text:
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) != 3:
+            return None
+        name, price_raw, category = parts
+    else:
+        # Format tanpa "|": Nama .... Harga Kategori
+        tokens = text.split()
+        if len(tokens) < 3:
+            return None
+        price_raw = tokens[-2]
+        category = tokens[-1]
+        name = " ".join(tokens[:-2])
+
+    def to_int(s: str):
+        s = s.replace("Rp", "").replace("rp", "")
+        s = s.replace(".", "").replace(",", "")
+        return s
+
+    price_clean = to_int(price_raw)
+    if not price_clean.isdigit():
+        return None
+
+    price_int = int(price_clean)
+    if not name or not category:
+        return None
+
+    return name, price_int, category
+
 
 async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["add_product_attempts"] = 2  # 2 kesempatan salah
+    context.user_data["add_product_attempts"] = 3  # 3 kesempatan salah
     msg = (
         "➕ *Tambah Produk*\n\n"
-        "Kirim data dengan format:\n"
-        "`Nama Produk | Harga | Kategori`\n\n"
-        "Contoh:\n"
-        "`Kaos Polo | 150000 | Pakaian`"
+        "Kamu bisa pakai *dua gaya input*:\n"
+        "1️⃣ `Nama Produk | Harga | Model`\n"
+        "2️⃣ `Nama Produk Harga Model`\n\n"
+        "Contoh valid:\n"
+        "`Kaos Polo | 150000 | Pakaian`\n"
+        "`Kaos Polo 150000 Pakaian`"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
     return ADD_PRODUCT
@@ -308,20 +435,19 @@ async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_product_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    parts = [p.strip() for p in text.split("|")]
+    parsed = _parse_product_input(text)
 
-    def price_to_int(s):
-        return s.replace(".", "").replace(",", "")
-
-    if len(parts) != 3 or not price_to_int(parts[1]).isdigit():
+    if not parsed:
         attempts = context.user_data.get("add_product_attempts", 0)
         if attempts > 0:
             context.user_data["add_product_attempts"] = attempts - 1
             msg = (
-                "❌ *Format salah!* Gunakan format:\n"
-                "`Nama Produk | Harga | Kategori`\n\n"
+                "❌ *Format salah!* Gunakan salah satu format berikut:\n"
+                "1️⃣ `Nama Produk | Harga | Model`\n"
+                "2️⃣ `Nama Produk Harga Model`\n\n"
                 "Contoh:\n"
-                "`Kaos Polo | 150000 | Pakaian`\n\n"
+                "`Kaos Polo | 150000 | Pakaian`\n"
+                "`Kaos Polo 150000 Pakaian`\n\n"
                 f"⚠️ Sisa kesempatan: {attempts}"
             )
             await update.message.reply_text(msg, parse_mode="Markdown")
@@ -332,22 +458,22 @@ async def add_product_process(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return ConversationHandler.END
 
-    name, price_str, category = parts
-    price_int = int(price_to_int(price_str))
-
+    name, price_int, category = parsed
     add_product_db(name, price_int, category)
 
     msg = (
         "✅ *Produk berhasil ditambahkan!*\n\n"
-        f"Nama     : {name}\n"
-        f"Harga    : Rp {price_int:,}\n"
-        f"Kategori : {category}"
+        f"📛 Nama   : {name}\n"
+        f"💰 Harga  : Rp {price_int:,}\n"
+        f"🏷 Model  : {category}"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
     return ConversationHandler.END
 
 
-# ---------- Tambah Penjualan (Conversation) ----------
+# =========================
+# TAMBAH PENJUALAN (Conversation)
+# =========================
 
 async def add_sale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     products = list_products_db(limit=15)
@@ -360,7 +486,7 @@ async def add_sale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = []
     for pid, name, price, category in products:
-        lines.append(f"{pid}. {name} — Rp {price:,} ({category})")
+        lines.append(f"🆔 {pid} — {name} (Rp {price:,}, {category})")
 
     msg = (
         "💰 *Tambah Penjualan*\n\n"
@@ -401,24 +527,26 @@ async def add_sale_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         "✅ *Penjualan tercatat!*\n\n"
-        f"Produk : {name}\n"
-        f"Harga  : Rp {price:,}\n"
-        f"Qty    : {qty}\n"
-        f"Total  : Rp {total:,}"
+        f"📦 Produk : {name}\n"
+        f"💰 Harga  : Rp {price:,}\n"
+        f"🔢 Qty    : {qty}\n"
+        f"📊 Total  : Rp {total:,}"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
     return ConversationHandler.END
 
 
-# ---------- Hapus Produk (Conversation) ----------
+# =========================
+# HAPUS PRODUK (Conversation)
+# =========================
 
 async def delete_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    products = list_products_db(limit=15)
+    products = list_products_db(limit=30)
     if not products:
         await update.message.reply_text("⚠️ Tidak ada produk untuk dihapus.")
         return ConversationHandler.END
 
-    lines = [f"{pid}. {name} — Rp {price:,}" for pid, name, price, _ in products]
+    lines = [f"🆔 {pid} — {name} (Rp {price:,})" for pid, name, price, _ in products]
     msg = (
         "🗑 *Hapus Produk*\n\n"
         "Kirim *ID produk* yang ingin dihapus.\n\n"
@@ -445,15 +573,153 @@ async def delete_product_process(update: Update, context: ContextTypes.DEFAULT_T
 
     msg = (
         "✅ Produk berhasil dihapus.\n\n"
-        f"ID   : {pid}\n"
-        f"Nama : {name}\n"
-        f"Harga: Rp {price:,}"
+        f"🆔 ID   : {pid}\n"
+        f"📛 Nama : {name}\n"
+        f"💰 Harga: Rp {price:,}"
     )
     await update.message.reply_text(msg)
     return ConversationHandler.END
 
 
-# ---------- Menu Kelola Produk & Utility ----------
+# =========================
+# EDIT PRODUK (Conversation)
+# =========================
+
+async def edit_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    products = list_products_db(limit=30)
+    if not products:
+        await update.message.reply_text("⚠️ Belum ada produk untuk diedit.")
+        return ConversationHandler.END
+
+    lines = [f"🆔 {pid} — {name} (Rp {price:,}, {category})"
+             for pid, name, price, category in products]
+    msg = (
+        "✏️ *Edit Produk*\n\n"
+        "Kirim *ID produk* yang mau diedit.\n\n"
+        "*Daftar Produk:*\n" + "\n".join(lines)
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return EDIT_PRODUCT_SELECT
+
+
+async def edit_product_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("ID harus angka. Coba lagi.")
+        return EDIT_PRODUCT_SELECT
+
+    pid = int(text)
+    product = get_product_by_id(pid)
+    if not product:
+        await update.message.reply_text("⚠️ Produk tidak ditemukan. Coba ID lain.")
+        return EDIT_PRODUCT_SELECT
+
+    context.user_data["edit_pid"] = pid
+    _, name, price, category = product
+
+    msg = (
+        "Produk yang akan diedit:\n\n"
+        f"🆔 ID   : {pid}\n"
+        f"📛 Nama : {name}\n"
+        f"💰 Harga: Rp {price:,}\n"
+        f"🏷 Model: {category}\n\n"
+        "Pilih bagian yang mau diubah:"
+    )
+    await update.message.reply_text(
+        msg, parse_mode="Markdown", reply_markup=edit_product_field_keyboard()
+    )
+    return EDIT_PRODUCT_FIELD
+
+
+async def edit_product_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = update.message.text.strip()
+    if choice == BTN_EDIT_NAME:
+        context.user_data["edit_field"] = "name"
+        await update.message.reply_text(
+            "✏️ Kirim *nama produk baru*:",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return EDIT_PRODUCT_VALUE
+
+    if choice == BTN_EDIT_PRICE:
+        context.user_data["edit_field"] = "price"
+        await update.message.reply_text(
+            "💰 Kirim *harga baru* (angka saja, boleh pakai titik/koma):",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return EDIT_PRODUCT_VALUE
+
+    if choice == BTN_EDIT_CATEGORY:
+        context.user_data["edit_field"] = "category"
+        await update.message.reply_text(
+            "🏷 Kirim *model/kategori baru*:",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return EDIT_PRODUCT_VALUE
+
+    if choice == BTN_CANCEL_EDIT:
+        await update.message.reply_text(
+            "❌ Edit produk dibatalkan.",
+            reply_markup=manage_product_keyboard(),
+        )
+        context.user_data.pop("edit_pid", None)
+        context.user_data.pop("edit_field", None)
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Pilih salah satu opsi yang tersedia di keyboard.", parse_mode="Markdown"
+    )
+    return EDIT_PRODUCT_FIELD
+
+
+async def edit_product_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pid = context.user_data.get("edit_pid")
+    field = context.user_data.get("edit_field")
+    if not pid or not field:
+        await update.message.reply_text("Sesi edit tidak valid, silakan mulai lagi.")
+        return ConversationHandler.END
+
+    value_text = update.message.text.strip()
+
+    if field == "price":
+        cleaned = value_text.replace("Rp", "").replace("rp", "")
+        cleaned = cleaned.replace(".", "").replace(",", "")
+        if not cleaned.isdigit():
+            await update.message.reply_text(
+                "Harga harus angka. Kirim ulang harga baru:"
+            )
+            return EDIT_PRODUCT_VALUE
+        value = int(cleaned)
+    else:
+        value = value_text
+
+    update_product_field(pid, field, value)
+
+    product = get_product_by_id(pid)
+    _, name, price, category = product
+
+    msg = (
+        "✅ Produk berhasil diupdate!\n\n"
+        f"🆔 ID   : {pid}\n"
+        f"📛 Nama : {name}\n"
+        f"💰 Harga: Rp {price:,}\n"
+        f"🏷 Model: {category}"
+    )
+    await update.message.reply_text(
+        msg, parse_mode="Markdown", reply_markup=manage_product_keyboard()
+    )
+
+    context.user_data.pop("edit_pid", None)
+    context.user_data.pop("edit_field", None)
+    return ConversationHandler.END
+
+
+# =========================
+# MENU KELOLA PRODUK & LIST
+# =========================
 
 async def manage_product_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -464,18 +730,31 @@ async def manage_product_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def list_products_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    products = list_products_db(limit=30)
+    products = list_products_db(limit=50)
     if not products:
         await update.message.reply_text("📦 Belum ada produk.")
         return
 
     lines = []
     for pid, name, price, category in products:
-        lines.append(f"{pid}. {name} — Rp {price:,} ({category})")
+        lines.append(
+            f"🆔 *ID {pid}* - {name}\n"
+            f"💰 Rp {price:,}\n"
+            f"🏷 {category}\n"
+        )
 
-    msg = "*Daftar Produk:*\n\n" + "\n".join(lines)
+    msg = (
+        "📦 *Daftar Produk Anda* (Halaman 1/1)\n\n"
+        + "\n".join(lines)
+        + f"\nTotal: {len(products)} produk\n\n"
+          "Gunakan *Edit Produk* atau *Hapus Produk* dari menu untuk mengelola produk."
+    )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+
+# =========================
+# DAFTAR PENJUALAN & LAPORAN
+# =========================
 
 async def list_sales_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sales = list_sales_db(limit=10)
@@ -518,21 +797,37 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# =========================
+# PENGATURAN & UTILITY
+# =========================
+
 async def settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    notif = "✅" if is_subscribed(chat_id) else "❌"
+
     msg = (
-        "⚙️ *Pengaturan Sederhana*\n\n"
-        "- Mata uang : Rupiah (Rp)\n"
-        "- Zona waktu laporan : WIB\n\n"
-        "Untuk sementara belum bisa diubah dari bot. "
-        "Nanti bisa kita upgrade jadi lebih advanced."
+        "⚙️ *Pengaturan Bot*\n\n"
+        "💰 Mata Uang: Rp\n"
+        "📅 Format Tanggal: DD/MM/YYYY\n"
+        "🔐 Auto Backup: ❌ (manual via menu Utility)\n"
+        f"🔔 Notifikasi Harian: {notif}\n\n"
+        "Gunakan *Edit Pengaturan* dari menu Utility untuk mengubah pengaturan."
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def utility_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🧰 *Menu Utility*\nPilih utilitas yang kamu mau:",
+        "🧰 *Menu Utility*\nPilih utilitas yang ingin digunakan:",
         reply_markup=utility_keyboard(),
+        parse_mode="Markdown",
+    )
+
+
+async def edit_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚙️ *Edit Pengaturan*\nPilih pengaturan yang ingin diubah:",
+        reply_markup=settings_edit_keyboard(),
         parse_mode="Markdown",
     )
 
@@ -595,23 +890,90 @@ async def export_data_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
+async def currency_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💰 Mata uang saat ini: *Rp*\n\nCustom mata uang bakal gue siapin di versi next.",
+        parse_mode="Markdown",
+    )
+
+
+async def date_format_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📅 Format tanggal saat ini: *DD/MM/YYYY*.\n"
+        "Belum bisa diubah via bot, nanti bisa diupgrade.",
+        parse_mode="Markdown",
+    )
+
+
+async def autobackup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔐 Auto backup belum aktif.\n\n"
+        "Untuk sekarang, pakai *Backup Data* di menu Utility kalau mau backup manual.",
+        parse_mode="Markdown",
+    )
+
+
+async def notification_toggle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    current = is_subscribed(chat_id)
+    new_state = not current
+    set_subscription(chat_id, new_state)
+
+    status = "diaktifkan ✅" if new_state else "dinonaktifkan ❌"
+    msg = (
+        f"🔔 Notifikasi harian {status}.\n\n"
+        "Bot akan mengirim pengingat setiap hari supaya kamu nggak lupa input penjualan."
+    )
+    await update.message.reply_text(msg)
+
+
+# =========================
+# BANTUAN
+# =========================
+
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "❓ *Bantuan Bot Rekap Penjualan*\n\n"
-        "• Tambah Produk:\n"
-        "  Pilih menu *Tambah Produk* lalu kirim:\n"
-        "  `Nama Produk | Harga | Kategori`\n\n"
-        "• Tambah Penjualan:\n"
-        "  Pilih menu *Tambah Penjualan*, cek daftar produk,\n"
-        "  lalu kirim: `ID Produk | Qty`\n\n"
-        "• Laporan:\n"
-        "  Menu *Laporan* akan menampilkan rekap hari ini,\n"
-        "  bulan ini, dan top produk.\n\n"
-        "• Backup / Export:\n"
-        "  Masuk menu *Utility* untuk backup DB & export CSV.\n\n"
-        "Kapan pun bisa kirim /start buat balik ke menu utama."
+        "❓ *Panduan Penggunaan Bot Penjualan*\n\n"
+        "🧱 *Manajemen Produk:*\n"
+        "- Tambah Produk: Tambah produk baru\n"
+        "- Daftar Produk: Lihat daftar produk\n"
+        "- Edit Produk: Ubah nama/harga/model\n"
+        "- Hapus Produk: Hapus produk\n\n"
+        "💰 *Manajemen Penjualan:*\n"
+        "- Tambah Penjualan: Tambah transaksi baru\n"
+        "- Daftar Penjualan: Lihat riwayat penjualan\n\n"
+        "📈 *Laporan:*\n"
+        "- Rekap harian & bulanan\n"
+        "- Top produk terlaris\n\n"
+        "🧰 *Utility:*\n"
+        "- Backup Data: Backup database\n"
+        "- Export Data: Export ke CSV\n"
+        "- Edit Pengaturan: Ubah notifikasi harian, dll.\n\n"
+        "Tips: pakai tombol keyboard biar input lebih cepat."
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+# =========================
+# NOTIFIKASI HARIAN (JOB)
+# =========================
+
+async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT chat_id FROM subscriptions WHERE enabled = 1")
+    chats = [row[0] for row in c.fetchall()]
+    conn.close()
+
+    for chat_id in chats:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="📣 Reminder: Jangan lupa input penjualan hari ini di bot VanzShop.id!"
+            )
+        except Exception:
+            # kalau chat ga bisa dikirimin (user block dll), skip aja
+            continue
 
 
 # =========================
@@ -622,6 +984,12 @@ def main():
     init_db()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Job reminder harian jam 20:00 (ikut timezone container / TZ=Asia/Jakarta)
+    app.job_queue.run_daily(
+        daily_notification,
+        time=time(hour=20, minute=0)
+    )
 
     # Conversation: Tambah Produk
     conv_add_product = ConversationHandler(
@@ -650,12 +1018,30 @@ def main():
         fallbacks=[CommandHandler("cancel", handle_back_main)],
     )
 
+    # Conversation: Edit Produk
+    conv_edit_product = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(f"^{BTN_EDIT_PRODUCT}$"), edit_product_start)],
+        states={
+            EDIT_PRODUCT_SELECT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_select)
+            ],
+            EDIT_PRODUCT_FIELD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_field)
+            ],
+            EDIT_PRODUCT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_value)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", handle_back_main)],
+    )
+
     # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))
 
     app.add_handler(conv_add_product)
     app.add_handler(conv_add_sale)
     app.add_handler(conv_delete_product)
+    app.add_handler(conv_edit_product)
 
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_MANAGE_PRODUCT}$"), manage_product_menu))
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST_PRODUCTS}$"), list_products_handler))
@@ -666,12 +1052,19 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_UTILITY}$"), utility_menu))
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_BACKUP_DATA}$"), backup_data_handler))
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_EXPORT_DATA}$"), export_data_handler))
+    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_EDIT_SETTINGS}$"), edit_settings_menu))
+
+    # Submenu pengaturan
+    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_CURRENCY}$"), currency_handler))
+    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_DATE_FORMAT}$"), date_format_handler))
+    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_AUTO_BACKUP}$"), autobackup_handler))
+    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_NOTIFICATION}$"), notification_toggle_handler))
 
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_HELP}$"), help_handler))
 
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_BACK_MAIN}$"), handle_back_main))
 
-    print("Bot rekap penjualan jalan...")
+    print("Bot rekap penjualan jalan (versi interaktif)...")
     app.run_polling()
 
 
