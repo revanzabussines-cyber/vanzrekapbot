@@ -66,7 +66,7 @@ BTN_DATE_FORMAT = "📅 Format Tanggal"
 BTN_AUTO_BACKUP = "🔐 Auto Backup"
 BTN_NOTIFICATION = "🔔 Notifikasi"
 
-# Untuk edit produk (field)
+# Field edit produk
 BTN_EDIT_NAME = "✏️ Ubah Nama"
 BTN_EDIT_PRICE = "💰 Ubah Harga"
 BTN_EDIT_CATEGORY = "🏷 Ubah Model/Kategori"
@@ -106,7 +106,7 @@ def init_db():
         """
     )
 
-    # Untuk notifikasi harian per chat
+    # Subs notifikasi harian per chat
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS subscriptions (
@@ -273,14 +273,12 @@ def get_top_products(limit: int = 5):
     return rows
 
 
-# === Subscriptions (notif harian) ===
+# ===== Subscriptions (notif harian) =====
 
 def is_subscribed(chat_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        "SELECT enabled FROM subscriptions WHERE chat_id = ?", (chat_id,)
-    )
+    c.execute("SELECT enabled FROM subscriptions WHERE chat_id = ?", (chat_id,))
     row = c.fetchone()
     conn.close()
     if not row:
@@ -360,8 +358,17 @@ def edit_product_field_keyboard():
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🏠 *Menu Utama*\n\n"
-        "Bot rekap penjualan VanzShop.\n\n"
-        "Silakan pilih menu di bawah:"
+        "Selamat datang di *Bot Rekap Penjualan VanzShop* 🚀\n\n"
+        "Pakai tombol di bawah buat navigasi:\n\n"
+        "🛒 *Tambah Produk*  → input produk baru\n"
+        "💰 *Tambah Penjualan* → catat transaksi jualan\n"
+        "📦 *Kelola Produk* → edit / hapus / lihat daftar produk\n"
+        "📊 *Daftar Penjualan* → lihat riwayat transaksi\n"
+        "📈 *Laporan* → rekap harian, bulanan & top produk\n"
+        "⚙️ *Pengaturan* → cek status notifikasi harian\n"
+        "🧰 *Utility* → backup & export data\n"
+        "❓ *Bantuan* → panduan penggunaan singkat\n\n"
+        "Silakan pilih menu lewat keyboard di bawah 👇"
     )
     await update.message.reply_text(
         text, reply_markup=main_menu_keyboard(), parse_mode="Markdown"
@@ -376,14 +383,14 @@ async def handle_back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# TAMBAH PRODUK (Conversation)
+# PARSER INPUT PRODUK
 # =========================
 
 def _parse_product_input(text: str):
     """
     Support 2 format:
-    1) Nama | Harga | Kategori
-    2) Nama Harga Kategori  (tanpa |, harga = kata kedua dari belakang)
+    1) Nama | Harga | Model
+    2) Nama Harga Model  (tanpa |, harga = kata kedua dari belakang)
     """
     text = text.strip()
 
@@ -394,7 +401,7 @@ def _parse_product_input(text: str):
             return None
         name, price_raw, category = parts
     else:
-        # Format tanpa "|": Nama .... Harga Kategori
+        # Format tanpa "|": Nama .... Harga Model
         tokens = text.split()
         if len(tokens) < 3:
             return None
@@ -418,6 +425,10 @@ def _parse_product_input(text: str):
     return name, price_int, category
 
 
+# =========================
+# TAMBAH PRODUK (Conversation)
+# =========================
+
 async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["add_product_attempts"] = 3  # 3 kesempatan salah
     msg = (
@@ -435,12 +446,35 @@ async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_product_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+
+    # Kalau user pencet tombol menu lain, batalin mode tambah produk
+    if text in {
+        BTN_BACK_MAIN,
+        BTN_ADD_PRODUCT,
+        BTN_ADD_SALE,
+        BTN_MANAGE_PRODUCT,
+        BTN_LIST_PRODUCTS,
+        BTN_EDIT_PRODUCT,
+        BTN_DELETE_PRODUCT,
+        BTN_LIST_SALES,
+        BTN_REPORT,
+        BTN_SETTINGS,
+        BTN_UTILITY,
+        BTN_HELP,
+    }:
+        await update.message.reply_text(
+            "❌ Input produk dibatalkan. Kamu bisa lanjut pakai menu lain.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
     parsed = _parse_product_input(text)
 
     if not parsed:
         attempts = context.user_data.get("add_product_attempts", 0)
         if attempts > 0:
-            context.user_data["add_product_attempts"] = attempts - 1
+            attempts -= 1
+            context.user_data["add_product_attempts"] = attempts
             msg = (
                 "❌ *Format salah!* Gunakan salah satu format berikut:\n"
                 "1️⃣ `Nama Produk | Harga | Model`\n"
@@ -454,7 +488,8 @@ async def add_product_process(update: Update, context: ContextTypes.DEFAULT_TYPE
             return ADD_PRODUCT
         else:
             await update.message.reply_text(
-                "❌ Terlalu banyak percobaan. Tambah produk dibatalkan."
+                "❌ Terlalu banyak percobaan. Tambah produk dibatalkan.",
+                reply_markup=main_menu_keyboard(),
             )
             return ConversationHandler.END
 
@@ -467,7 +502,9 @@ async def add_product_process(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"💰 Harga  : Rp {price_int:,}\n"
         f"🏷 Model  : {category}"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(
+        msg, parse_mode="Markdown", reply_markup=main_menu_keyboard()
+    )
     return ConversationHandler.END
 
 
@@ -892,7 +929,7 @@ async def export_data_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def currency_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "💰 Mata uang saat ini: *Rp*\n\nCustom mata uang bakal gue siapin di versi next.",
+        "💰 Mata uang saat ini: *Rp*\n\nCustom mata uang bakal disiapin di versi next.",
         parse_mode="Markdown",
     )
 
@@ -972,7 +1009,6 @@ async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
                 text="📣 Reminder: Jangan lupa input penjualan hari ini di bot VanzShop.id!"
             )
         except Exception:
-            # kalau chat ga bisa dikirimin (user block dll), skip aja
             continue
 
 
@@ -985,11 +1021,12 @@ def main():
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Job reminder harian jam 20:00 (ikut timezone container / TZ=Asia/Jakarta)
-    app.job_queue.run_daily(
-        daily_notification,
-        time=time(hour=20, minute=0)
-    )
+    # Job reminder harian jam 20:00 (ikut TZ container / TZ=Asia/Jakarta)
+    if app.job_queue:
+        app.job_queue.run_daily(
+            daily_notification,
+            time=time(hour=20, minute=0)
+        )
 
     # Conversation: Tambah Produk
     conv_add_product = ConversationHandler(
